@@ -39,3 +39,30 @@ python run_bo_nas_search_v3.py \
     --n_trials 20 \
     --eval_steps 800 \
     --use_gpu
+
+## 📚 支援任務與資料集
+
+本專案支援 GLUE Benchmark (NLU) 以及常見的生成式任務 (NLG)：
+
+### NLU (自然語言理解) - GLUE Benchmark
+- **CoLA**: 語言合法性判定
+- **SST-2**: 情感分析
+- **MRPC/QQP**: 語義相似度
+- **MNLI/QNLI/RTE**: 自然語言推理 (NLI)
+- **STS-B**: 語義相關性評分 (回歸任務)
+
+### NLG (自然語言生成) & QA
+- **SQuAD v2.0**: 問答任務
+- **XSum / CNN/DailyMail**: 摘要生成 (需配合 BART/T5 等模型)
+
+## ⚙️ 關鍵超參數說明
+
+在執行 `run_bo_nas_search_v3.py` 時，主要調整以下參數：
+
+| 參數 | 預設值 | 說明 |
+| :--- | :--- | :--- |
+| `--model_name` | `bert-base-uncased` | 預訓練模型名稱（支援 DeBERTaV3, RoBERTa 等） |
+| `--eval_steps` | `800` | 搜索階段每個 Trial 訓練的步數 |
+| `--n_probe_samples`| `256` | Act-LoRA 體檢（激活範數測量）所用的樣本數 |
+| `--r_budget_total` | `64` | Act-LoRA 初始分配的總 Rank 預算 |
+| `--n_trials` | `20` | 貝葉斯優化總共嘗試的次數 |
