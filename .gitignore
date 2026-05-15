@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Experiment outputs / checkpoints
+pso_adalora_bert_mnli_result/
+checkpoint-*/
+*.safetensors
+training_args.bin
+trainer_state.json
+
+# Logs & tracking
+*.log
+runs/
+wandb/
+
+# Checkpoints
+*.ckpt
+*.pt
+*.pth
+
+# HF / datasets cache (optional)
+.cache/
+cache/
+datasets/
