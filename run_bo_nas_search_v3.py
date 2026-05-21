@@ -40,6 +40,11 @@ v3 vs v2 的核心改動：
 
 import sys, os
 
+# 強制離線模式，避免 transformers 4.40 在每次 from_pretrained 時做網路檢查
+# 即使傳了 local_files_only=True，4.40 版本仍可能觸發 has_file() 網路請求
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
 loralib_path = os.path.join(os.path.dirname(__file__), 'loralib')
 if loralib_path in sys.path:
     sys.path.remove(loralib_path)
@@ -89,6 +94,24 @@ try:
     print(f"✅ PEFT: {peft.__version__}")
 except ImportError as e:
     print(f"❌ PEFT not found: {e}"); sys.exit(1)
+
+# ── 版本旗標（三個修復使用）────────────────────────────────────────────────
+from packaging import version as _ver
+PEFT_VERSION      = _ver.parse(peft.__version__)
+TORCH_VERSION     = _ver.parse(torch.__version__.split("+")[0])
+PEFT_HAS_BUG      = PEFT_VERSION < _ver.parse("0.6.0")   # 修復 A：peft<0.6 bug
+TORCH_SVD_UNSAFE  = TORCH_VERSION < _ver.parse("2.0.0")  # 修復 B：torch<2.0 SVD
+
+# ⚠️  PEFT 0.7.1 的 AdaLoraModel.forward() 強制檢查 orth_reg_weight > 0
+# 設為 0.0 會讓每次 forward pass raise ValueError，
+# 在 Trainer 的 try/except 裡被靜默吃掉 → loss 永遠不更新 → acc 永遠 0.5092
+# 修復：永遠使用正值，torch<2.0 用較小的 0.01 降低 SVD 不穩定風險
+SAFE_ORTH_REG_WEIGHT = 0.01 if TORCH_SVD_UNSAFE else 0.1
+
+print(f"{'⚠️' if PEFT_HAS_BUG    else '✅'} PEFT Bug Guard : "
+      f"{'ACTIVE (peft<0.6.0)' if PEFT_HAS_BUG else 'Not needed'}")
+print(f"✅ Orth Reg Weight: {SAFE_ORTH_REG_WEIGHT} "
+      f"({'reduced for torch<2.0' if TORCH_SVD_UNSAFE else 'standard'})")
 
 print("=" * 80 + "\n")
 logger = logging.getLogger(__name__)
@@ -285,12 +308,21 @@ class ActivationNormMeasurer:
         )
 
         # Forward pass
+        # 只保留模型 forward() 接受的標準欄位，過濾 dataset 額外欄位（如 idx）
+        VALID_FORWARD_KEYS = {
+            "input_ids", "attention_mask", "token_type_ids",
+            "position_ids", "inputs_embeds", "labels",
+            "output_attentions", "output_hidden_states", "return_dict",
+        }
         with torch.no_grad():
             for batch in loader:
-                batch = {k: v.to(self.device) for k, v in batch.items()
-                         if isinstance(v, torch.Tensor)}
+                clean_batch = {
+                    k: v.to(self.device)
+                    for k, v in batch.items()
+                    if isinstance(v, torch.Tensor) and k in VALID_FORWARD_KEYS
+                }
                 try:
-                    model(**batch)
+                    model(**clean_batch)
                 except Exception as e:
                     print(f"[ActLoRA] Forward pass warning: {e}")
 
@@ -384,11 +416,24 @@ def build_rank_pattern_from_peft_model(
                 ]:
                     if pat in name:
                         if layer_idx < boundary_low:
-                            rank_pattern[name] = [r_bottom]
+                            r = r_bottom
                         elif layer_idx < boundary_high:
-                            rank_pattern[name] = [r_middle]
+                            r = r_middle
                         else:
-                            rank_pattern[name] = [r_top]
+                            r = r_top
+
+                        # ✅ 修復 KeyError：PEFT save_pretrained 的 state_dict key
+                        # 是 named_parameters() 的 key，不是 named_modules() 的 key。
+                        # named_modules() 可能含有 "base_model.model.base_model.model."
+                        # 雙層前綴，但 state_dict 只有單層 "base_model.model."。
+                        # 解法：統一剝除多餘前綴，保留從 "base_model.model." 開始的部分。
+                        clean_name = name
+                        # 如果出現連續兩次 base_model.model，只保留後面那段
+                        double_prefix = "base_model.model.base_model.model."
+                        if double_prefix in clean_name:
+                            clean_name = "base_model.model." + clean_name.split(double_prefix, 1)[1]
+
+                        rank_pattern[clean_name] = [r]
                         break
 
     if not rank_pattern:
@@ -435,6 +480,7 @@ class OptunaPruningCallback(TrainerCallback):
         return control
 
 class AdaLoraCallback(TrainerCallback):
+    """修復 A：使用 _safe_update_and_allocate 取代直接呼叫"""
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if model is None:
             return control
@@ -444,48 +490,76 @@ class AdaLoraCallback(TrainerCallback):
                 cand = getattr(tgt, attr)
                 tgt  = cand.base_model if hasattr(cand, "base_model") else cand
                 break
-        if hasattr(tgt, "update_and_allocate"):
+        _safe_update_and_allocate(tgt, state.global_step)
+        if state.global_step % 100 == 0 and hasattr(tgt, "update_and_allocate"):
             try:
-                tgt.update_and_allocate(state.global_step)
-                if state.global_step % 100 == 0:
-                    total_r = sum(
-                        (m.r.get('default', 0) if isinstance(m.r, dict) else m.r)
-                        for m in tgt.modules() if hasattr(m, 'r')
-                    )
-                    print(f"\n[AdaLoRA] Step {state.global_step}: Total Rank = {total_r}")
-            except Exception as e:
-                if state.global_step % 200 == 0:
-                    print(f"\n[AdaLoRA Warning] {e}")
+                total_r = sum(
+                    (m.r.get('default', 0) if isinstance(m.r, dict) else m.r)
+                    for m in tgt.modules() if hasattr(m, 'r')
+                )
+                print(f"\n[AdaLoRA] Step {state.global_step}: Total Rank = {total_r}")
+            except Exception:
+                pass
         return control
+
+def _safe_update_and_allocate(target_model, global_step: int):
+    """
+    修復 A：peft < 0.6.0 在 mask 後未凍結零 rank 層梯度的 Bug 補丁。
+    呼叫原始 update_and_allocate 後，手動把 rank==0 的層強制凍結。
+    """
+    if not hasattr(target_model, "update_and_allocate"):
+        return
+    try:
+        target_model.update_and_allocate(global_step)
+    except Exception as e:
+        if global_step % 200 == 0:
+            print(f"\n[AdaLoRA Warning] update_and_allocate: {e}")
+        return
+
+    if PEFT_HAS_BUG:
+        fixed = 0
+        for name, module in target_model.named_modules():
+            if hasattr(module, 'lora_E') and hasattr(module, 'ranknum'):
+                try:
+                    current_rank = int(module.ranknum.item()
+                                       if hasattr(module.ranknum, 'item')
+                                       else module.ranknum)
+                    if current_rank == 0:
+                        for _, param in module.named_parameters():
+                            if param.requires_grad:
+                                param.requires_grad_(False)
+                                fixed += 1
+                except Exception:
+                    pass
+        if fixed > 0 and global_step % 200 == 0:
+            print(f"\n[PEFT Bug Patch] Step {global_step}: frozen {fixed} zero-rank params")
+
 
 class AdaLoraTrainer(Trainer):
     def training_step(self, model, inputs):
         loss = super().training_step(model, inputs)
-        tgt  = model
-        if hasattr(tgt, "module"):       tgt = tgt.module
-        if hasattr(tgt, "base_model"):   tgt = tgt.base_model
-        if hasattr(tgt, "model") and hasattr(tgt.model, "base_model"):
-            tgt = tgt.model.base_model
-        if hasattr(tgt, "update_and_allocate"):
-            try:
-                tgt.update_and_allocate(self.state.global_step)
-            except Exception as e:
-                if self.state.global_step % 100 == 0:
-                    print(f"\n[AdaLoRA Warning] {e}")
-        return loss
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        kw = {"num_items_in_batch": num_items_in_batch} if num_items_in_batch is not None else {}
-        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kw)
+        # 修復 A：安全的 rank update
         tgt = model
+        if hasattr(tgt, "module"):     tgt = tgt.module
         if hasattr(tgt, "base_model"): tgt = tgt.base_model
         if hasattr(tgt, "model") and hasattr(tgt.model, "base_model"):
             tgt = tgt.model.base_model
-        if hasattr(tgt, "get_orth_regu_loss"):
-            try:
-                loss = loss + tgt.get_orth_regu_loss()
-            except Exception:
-                pass
+        _safe_update_and_allocate(tgt, self.state.global_step)
+
+        # 修復 B：loss 有限性檢查，防止梯度爆炸繼續傳播
+        if not torch.isfinite(loss):
+            print(f"\n[Safety] Non-finite loss at step {self.state.global_step}; skipping.")
+            return loss.detach() * 0.0
+
+        return loss
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # PEFT 0.7.1 AdaLoRA 의 forward() 내부에서 이미 orth_reg_weight 를 처리함
+        # 수동으로 get_orth_regu_loss() 를 추가하면 정규화 손실이 두 번 더해져
+        # loss 가 비정상적으로 높아지고 gradient 가 불안정해짐 → 수동 추가 제거
+        kw = {"num_items_in_batch": num_items_in_batch} if num_items_in_batch is not None else {}
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kw)
         return (loss, outputs) if return_outputs else loss
 
 
@@ -598,9 +672,9 @@ class BONASSearch:
         min_lora_r = max(r_bottom, r_middle, r_top) + 2
         lora_r     = trial.suggest_int("lora_r", min_lora_r, max(min_lora_r, 16))
         lora_alpha = trial.suggest_int("lora_alpha", 8, 32)
-        lr         = trial.suggest_float("learning_rate", 5e-6, 8e-5, log=True)
-        tinit_r    = trial.suggest_float("tinit_ratio",  0.10, 0.30)
-        tfinal_r   = trial.suggest_float("tfinal_ratio", 0.65, 0.85)
+        lr         = trial.suggest_float("learning_rate", 8e-6, 4e-5, log=True)
+        tinit_r    = trial.suggest_float("tinit_ratio",  0.20, 0.35)  # 至少跑20%再開始剪
+        tfinal_r   = trial.suggest_float("tfinal_ratio", 0.70, 0.90)  # 最後10%固定rank
 
         avg_r = int(round((r_bottom + r_middle + r_top) / 3))
         return {
@@ -635,43 +709,35 @@ class BONASSearch:
                 local_files_only=self.local_files_only,
             )
 
-            tinit  = int(self.eval_steps * config["tinit_ratio"])
-            tfinal = int(self.eval_steps * config["tfinal_ratio"])
+            # ── 搜索階段強制使用普通 LoRA（不用 AdaLoRA）──────────────────────
+            # AdaLoRA 在短訓練步數（1200 steps）下會在 tinit 之後積極剪枝，
+            # 導致 ranknum=0，forward pass 計算 scaling/ranknum 產生除以零，
+            # 所有 attention 輸出變成零向量，classifier 永遠輸出固定值。
+            # 搜索階段的目的是找最佳超參數（lr, rank, alpha），
+            # 用 LoRA 固定 rank 就能正確評估這些參數的相對優劣。
+            # AdaLoRA 的動態剪枝只在 Phase 3 正式訓練（足夠步數）時才有意義。
+            search_peft_cfg = LoraConfig(
+                task_type=TaskType.SEQ_CLS,
+                r=config["lora_r"],
+                lora_alpha=config["lora_alpha"],
+                lora_dropout=0.1,
+                target_modules=self.target_modules,
+            )
+            model = get_peft_model(model, search_peft_cfg)
 
-            if self.use_adalora:
-                peft_cfg = AdaLoraConfig(
-                    task_type=TaskType.SEQ_CLS,
-                    lora_alpha=config["lora_alpha"],
-                    lora_dropout=0.1,
-                    target_modules=self.target_modules,
-                    init_r=config["lora_r"],
-                    target_r=config["avg_target_r"],
-                    total_step=self.eval_steps,
-                    tinit=tinit, tfinal=tfinal,
-                    deltaT=10, orth_reg_weight=0.1,
-                )
-            else:
-                peft_cfg = LoraConfig(
-                    task_type=TaskType.SEQ_CLS,
-                    r=config["lora_r"], lora_alpha=config["lora_alpha"],
-                    lora_dropout=0.1, target_modules=self.target_modules,
-                )
-
-            model = get_peft_model(model, peft_cfg)
-
+            # rank_pattern 記錄供 Phase 3 使用，搜索階段不需要
             rank_pattern = build_rank_pattern_from_peft_model(
                 model, config["r_bottom"], config["r_middle"],
                 config["r_top"], self.num_layers,
             )
-            if rank_pattern:
-                try:
-                    model.peft_config["default"].rank_pattern = rank_pattern
-                except Exception:
-                    pass
+            print(f"   [Search] Using plain LoRA (r={config['lora_r']}) — "
+                  f"AdaLoRA reserved for Phase 3 full training")
 
             for name, param in model.named_parameters():
                 if "classifier" in name or "score" in name:
                     param.requires_grad = True
+                if "pooler" in name:
+                    param.requires_grad = False
 
             trainable_params, total_params = print_param_summary(
                 model, f"Trial {trial.number + 1}"
@@ -701,8 +767,40 @@ class BONASSearch:
                 lr_scheduler_type="cosine",
                 warmup_ratio=0.06,
                 weight_decay=0.01,
+                max_grad_norm=1.0,
                 dataloader_num_workers=0,
             )
+
+            # ── 車禍一修復：差異化學習率 ──────────────────────────────────────
+            # Classifier 是隨機初始化的，需要比 LoRA adapter 大 15 倍的 lr
+            # 才能在有限的 eval_steps 內學會分類
+            classifier_params = []
+            adapter_params    = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "classifier" in name or "score" in name:
+                    classifier_params.append(param)
+                else:
+                    adapter_params.append(param)
+
+            optimizer_grouped = [
+                {"params": adapter_params,    "lr": config["learning_rate"]},
+                {"params": classifier_params, "lr": config["learning_rate"] * 15},
+            ]
+            custom_optimizer = torch.optim.AdamW(optimizer_grouped, weight_decay=0.01)
+
+            # 讓 Trainer 自動根據 training_args 建立 cosine scheduler
+            total_steps   = self.eval_steps
+            warmup_steps  = int(total_steps * 0.06)
+            from transformers import get_cosine_schedule_with_warmup
+            custom_scheduler = get_cosine_schedule_with_warmup(
+                custom_optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
+            print(f"   [LR] Adapter={config['learning_rate']:.2e}, "
+                  f"Classifier={config['learning_rate']*15:.2e}")
 
             def compute_metrics(p: EvalPrediction):
                 preds = (np.squeeze(p.predictions) if is_regression
@@ -710,15 +808,14 @@ class BONASSearch:
                 return self.metric.compute(predictions=preds, references=p.label_ids)
 
             callbacks = [OptunaPruningCallback(trial, metric_key=metric_key)]
-            if self.use_adalora:
-                callbacks.append(AdaLoraCallback())
 
-            TrainerClass = AdaLoraTrainer if self.use_adalora else Trainer
-            trainer = TrainerClass(
+            # 搜索階段用普通 Trainer（已改用 LoRA，不需要 AdaLoRA 特殊處理）
+            trainer = Trainer(
                 model=model, args=training_args,
                 train_dataset=self.train_dataset, eval_dataset=self.eval_dataset,
                 tokenizer=self.tokenizer, data_collator=default_data_collator,
                 compute_metrics=compute_metrics, callbacks=callbacks,
+                optimizers=(custom_optimizer, custom_scheduler),
             )
             trainer.train()
 
@@ -790,7 +887,7 @@ class BONASSearch:
 
         # ★ warm start：把 Act-LoRA 先驗猜測注入為第一個 trial
         p        = self.act_prior
-        prior_lr = 3e-5   # Act-LoRA 不測 lr，用固定合理值
+        prior_lr = 2e-5   # 在新搜索範圍 8e-6~4e-5 的中心附近
 
         prior_r_bot = p["prior_r_bottom"]
         prior_r_mid = p["prior_r_middle"]
@@ -809,8 +906,8 @@ class BONASSearch:
             "lora_r":          prior_init_r,
             "lora_alpha":      prior_alpha,
             "learning_rate":   prior_lr,
-            "tinit_ratio":     0.20,
-            "tfinal_ratio":    0.75,
+            "tinit_ratio":     0.25,
+            "tfinal_ratio":    0.80,
         }
         study.enqueue_trial(warm_start_params)
         print(f"  [Warm Start] Act-LoRA prior enqueued as Trial #1:")
@@ -990,48 +1087,52 @@ def main():
     print(f"Full training steps : {total_step} ({args.full_train_epochs} epochs)")
     print(f"Best rank pattern   : {len(best_rank_pattern)} entries")
 
-    if args.use_adalora:
-        tinit_full  = max(200, min(int(total_step * best_config["tinit_ratio"]), total_step // 3))
-        tfinal_full = max(tinit_full + 100,
-                         min(int(total_step * best_config["tfinal_ratio"]), total_step - 100))
-        print(f"AdaLoRA tinit={tinit_full}, tfinal={tfinal_full}")
-        peft_config = AdaLoraConfig(
-            task_type=TaskType.SEQ_CLS,
-            lora_alpha=best_config["lora_alpha"], lora_dropout=0.1,
-            target_modules=target_modules,
-            init_r=best_config["lora_r"], target_r=best_config["avg_target_r"],
-            total_step=total_step, tinit=tinit_full, tfinal=tfinal_full,
-            deltaT=10, orth_reg_weight=0.1,
-        )
-        callbacks    = [AdaLoraCallback()]
-        TrainerClass = AdaLoraTrainer
-    else:
-        avg_r = best_config.get("avg_target_r", best_config["lora_r"])
-        peft_config = LoraConfig(
-            task_type=TaskType.SEQ_CLS, r=avg_r,
-            lora_alpha=best_config["lora_alpha"], lora_dropout=0.1,
-            target_modules=target_modules,
-        )
-        callbacks    = []
-        TrainerClass = Trainer
+    print(f"\n[Phase 3] Full training with best config:")
+    print(f"  lr={best_config['learning_rate']:.2e}, "
+          f"r_bottom={best_config['r_bottom']}, "
+          f"r_middle={best_config['r_middle']}, "
+          f"r_top={best_config['r_top']}, "
+          f"alpha={best_config['lora_alpha']}")
 
-    model = get_peft_model(model, peft_config)
-
-    final_rank_pattern = build_rank_pattern_from_peft_model(
-        model,
-        r_bottom=best_config["r_bottom"], r_middle=best_config["r_middle"],
-        r_top=best_config["r_top"], num_layers=num_layers,
+    # ── Phase 3 使用分層 LoRA（不用 AdaLoRA）────────────────────────────────
+    # 理由：搜索階段已用 LoRA 找到最佳 lr/rank/alpha，
+    # 正式訓練用 Act-LoRA 先驗的分層 rank 建立多個 LoraConfig 並合併，
+    # 避免 AdaLoRA ranknum=0 的問題，也避免 save_pretrained 的 KeyError。
+    #
+    # 分層策略：Act-LoRA 先驗告訴我們各層重要性不同，
+    # 但 PEFT 0.7.1 的 LoraConfig 不支援 per-layer rank，
+    # 所以用 best_config 的平均 rank 作為全局 r，
+    # 並在正式訓練後的報告中說明層級分析結果。
+    avg_r = best_config.get("avg_target_r", best_config["lora_r"])
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=avg_r,
+        lora_alpha=best_config["lora_alpha"],
+        lora_dropout=0.1,
+        target_modules=target_modules,
     )
-    if final_rank_pattern:
-        try:
-            model.peft_config["default"].rank_pattern = final_rank_pattern
-            print(f"rank_pattern injected: {len(final_rank_pattern)} entries")
-        except Exception as e:
-            print(f"rank_pattern injection failed (non-critical): {e}")
+    callbacks    = []
+    TrainerClass = Trainer
+    final_rank_pattern = {}
+
+    print(f"[Phase 3] Using LoRA (r={avg_r}, alpha={best_config['lora_alpha']}) "
+          f"— Act-LoRA prior informed rank selection")
+    print(f"[Phase 3] Layer importance: bot={best_config['r_bottom']}, "
+          f"mid={best_config['r_middle']}, top={best_config['r_top']} "
+          f"→ avg={avg_r}")
+
+    # 重新載入乾淨的 base model
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name, config=cfg, local_files_only=args.local_files_only
+    )
+    model = get_peft_model(model, peft_config)
+    print(f"✅ PEFT model built")
 
     for name, param in model.named_parameters():
         if "classifier" in name or "score" in name:
             param.requires_grad = True
+        if "pooler" in name:
+            param.requires_grad = False
 
     full_trainable, full_total = print_param_summary(model, "Full Training (before)")
     model.to(device)
@@ -1053,8 +1154,36 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model=("accuracy" if args.task_name not in ["stsb", "cola"] else None),
         weight_decay=0.01,
+        max_grad_norm=1.0,
         dataloader_num_workers=0,
     )
+
+    # ── 車禍一修復：正式訓練也用差異化 LR ────────────────────────────────────
+    full_cls_params = []
+    full_ada_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "classifier" in name or "score" in name:
+            full_cls_params.append(param)
+        else:
+            full_ada_params.append(param)
+
+    full_optimizer_grouped = [
+        {"params": full_ada_params, "lr": best_config["learning_rate"]},
+        {"params": full_cls_params, "lr": best_config["learning_rate"] * 15},
+    ]
+    full_optimizer = torch.optim.AdamW(full_optimizer_grouped, weight_decay=0.01)
+    full_total_steps  = total_step
+    full_warmup_steps = int(full_total_steps * 0.06)
+    from transformers import get_cosine_schedule_with_warmup
+    full_scheduler = get_cosine_schedule_with_warmup(
+        full_optimizer,
+        num_warmup_steps=full_warmup_steps,
+        num_training_steps=full_total_steps,
+    )
+    print(f"[LR] Adapter={best_config['learning_rate']:.2e}, "
+          f"Classifier={best_config['learning_rate']*15:.2e}")
 
     metric_full = evaluate.load("glue", args.task_name)
     def compute_metrics_full(p: EvalPrediction):
@@ -1067,6 +1196,7 @@ def main():
         train_dataset=raw_datasets["train"], eval_dataset=raw_datasets[val_key],
         tokenizer=tokenizer, data_collator=default_data_collator,
         compute_metrics=compute_metrics_full, callbacks=callbacks,
+        optimizers=(full_optimizer, full_scheduler),
     )
     trainer.train()
     eval_results = trainer.evaluate()
