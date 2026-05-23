@@ -11,8 +11,8 @@
     "tfinal_ratio": 0.8,
     "debug_info": "r=10, target(bot/mid/top)=4/4/8, alpha=16, lr=2.00e-05"
   },
-  "best_score": 0.8411853908256881,
-  "best_params_count": 556036,
+  "best_score": 0.5176426000000001,
+  "best_params_count": 557574,
   "best_rank_pattern": {
     "base_model.model.deberta.encoder.layer.0.attention.self.query_proj": 4,
     "base_model.model.deberta.encoder.layer.0.attention.self.key_proj": 4,
@@ -53,23 +53,23 @@
   },
   "act_prior": {
     "layer_norms": [
-      6.626649076119065,
-      1.8651424227282405,
-      2.874036847613752,
-      4.956025846302509,
-      4.5454479437321424,
-      4.114602210000157,
-      4.869755988940597,
-      5.757867919281125,
-      3.20810420345515,
-      6.661028202623129,
-      7.844784559682012,
-      19.265106417238712
+      6.6266226805746555,
+      1.8527352241799235,
+      2.601524317637086,
+      4.956205248832703,
+      4.545336075127125,
+      4.115631274878979,
+      4.869903825223446,
+      5.758113123476505,
+      3.2082775738090277,
+      6.661004524677992,
+      7.916704680770636,
+      19.319224499166012
     ],
     "layer_ranks": [
       6,
       2,
-      3,
+      2,
       4,
       4,
       4,
@@ -83,15 +83,15 @@
     "prior_r_bottom": 4,
     "prior_r_middle": 4,
     "prior_r_top": 8,
-    "diversity": 0.7125308533194138
+    "diversity": 0.7198173121366072
   },
   "history": [
     {
       "trial": 1,
-      "fitness": 0.8411853908256881,
-      "accuracy": 0.8967889908256881,
-      "trainable_params": 556036,
-      "total_params": 184978180,
+      "fitness": 0.5176426000000001,
+      "accuracy": 0.5734,
+      "trainable_params": 557574,
+      "total_params": 184979718,
       "config": {
         "lora_r": 10,
         "lora_alpha": 16,
@@ -144,10 +144,10 @@
     },
     {
       "trial": 2,
-      "fitness": 0.5415440550458716,
-      "accuracy": 0.6192660550458715,
-      "trainable_params": 777220,
-      "total_params": 185199364,
+      "fitness": 0.2565242,
+      "accuracy": 0.3344,
+      "trainable_params": 778758,
+      "total_params": 185200902,
       "config": {
         "lora_r": 14,
         "lora_alpha": 11,
@@ -200,10 +200,10 @@
     },
     {
       "trial": 3,
-      "fitness": 0.8034206348623854,
-      "accuracy": 0.8922018348623854,
-      "trainable_params": 887812,
-      "total_params": 185309956,
+      "fitness": 0.507465,
+      "accuracy": 0.5964,
+      "trainable_params": 889350,
+      "total_params": 185311494,
       "config": {
         "lora_r": 16,
         "lora_alpha": 28,
@@ -256,10 +256,10 @@
     },
     {
       "trial": 4,
-      "fitness": 0.8196007449541285,
-      "accuracy": 0.8807339449541285,
-      "trainable_params": 611332,
-      "total_params": 185033476,
+      "fitness": 0.321513,
+      "accuracy": 0.3828,
+      "trainable_params": 612870,
+      "total_params": 185035014,
       "config": {
         "lora_r": 11,
         "lora_alpha": 23,
@@ -312,10 +312,10 @@
     },
     {
       "trial": 5,
-      "fitness": 0.7362938385321101,
-      "accuracy": 0.8084862385321101,
-      "trainable_params": 721924,
-      "total_params": 185144068,
+      "fitness": 0.2622538,
+      "accuracy": 0.3346,
+      "trainable_params": 723462,
+      "total_params": 185145606,
       "config": {
         "lora_r": 13,
         "lora_alpha": 22,
@@ -369,7 +369,7 @@
   ],
   "args": {
     "model_name": "microsoft/deberta-v3-base",
-    "task_name": "sst2",
+    "task_name": "mnli",
     "use_adalora": true,
     "use_lora": false,
     "n_trials": 5,
